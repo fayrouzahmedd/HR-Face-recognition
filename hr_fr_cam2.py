@@ -1,11 +1,11 @@
-# Face recognition attendance (SQLite) — FINAL with:
+# Face Recognition Attendance (SQLite) — FINAL
+# Features:
 # - Multi-face detection & recognition
 # - No MediaPipe / hand gesture logic
-# - Enrollment is triggered ONLY by pressing 'g'
-# - Minimal UI (name label; brief banner after logging)
-# - Attendance/Departure events are stored in SQLite (table: attendance), not CSV
-# - Arabic TTS added (gTTS, cached, non-blocking)
-# - New users logged into a separate SQLite table (new_users_log) upon enrollment
+# - Minimal UI (name label + short banner after logging)
+# - Attendance stored in SQLite (table: attendance) — not CSV
+# - Arabic TTS (gTTS) with caching + non-blocking playback
+# - New enrollments logged to SQLite (table: new_users_log)
 # - Arabic welcome/goodbye for authorized users on Arrival/Departure
 
 import os, sys, cv2, numpy as np, time, threading, shutil, re, traceback, pickle, sqlite3, hashlib, subprocess
@@ -14,118 +14,114 @@ from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 from collections import deque
 
-# -------- DeepFace (soft) --------
+# ---------- DeepFace (soft import) ----------
 try:
     from deepface import DeepFace
 except Exception as e:
     DeepFace = None
     print("[WARN] DeepFace is not available in this environment:", e)
 
-# ================ CONFIG ================
+# ===================== CONFIG =====================
+
 FAST_MODE = True
 
+# Folders / cache
 AUTHORIZED_DIR = Path("authorized_faces")
-CACHE_PATH     = Path("attendance") / "emb_cache.pkl"  # kept for legacy cache location
+CACHE_PATH     = Path("attendance") / "emb_cache.pkl"   # legacy cache location
 CACHE_ENABLED  = True
 
+# ---------- Camera config ----------
+USE_IP_CAMERA = True      # True => RTSP IP camera, False => local webcam
+CAM_INDEX     = 0         # used only when USE_IP_CAMERA = False
 
-# ---- Camera config ----
-USE_IP_CAMERA = True  # True → use Hikvision IP cam, False → use local webcam
-CAM_INDEX     = 0     # used only if USE_IP_CAMERA = False
-
-# Hikvision RTSP URL:
-# main stream: /Streaming/Channels/101
-# sub stream:  /Streaming/Channels/102  (lower resolution, usually better for realtime)
+# Hikvision RTSP:
+# - Main stream: /Streaming/Channels/101
+# - Sub stream : /Streaming/Channels/102  (usually better for realtime)
 #
 # IMPORTANT:
-# - Replace YOUR_PASSWORD with the real one.
-# - If the password contains '@', ':' or spaces, URL-encode them (e.g. '@' → '%40')
+# - If your password contains special chars like '@', ':' or spaces -> URL-encode them.
+#   Example: '@' => '%40'
 IP_CAM_URL = "rtsp://admin:Mori%40111288@192.168.1.64:554/Streaming/Channels/102"
 
-
-
-# ----------------------------------------------------------- #
-## stream_url = "url ip cam (full vlc media player)"
-## stream_url= "rtsp://admin:Mori@111288@192.168.1.64:554"
-# ----------------------------------------------------------- #
-
-
+# SQLite DB path
 AUTH_DB_PATH = Path("face_authorized.sqlite3")
 STORE_IMAGES_IN_DB = False
 
-# recognition thresholds
-# recognition thresholds  (STRONGER / SAFER)
-# recognition thresholds  (BALANCED)
-ACCEPT_DIST_THRESH = 0.38      # was 0.33
-REVOKE_DIST_THRESH = 0.50      # was 0.43
-TOP2_MARGIN_MIN    = 0.08      # was 0.12
-TOP2_RATIO_MAX     = 0.88      # was 0.80
+# ---------- Recognition thresholds (balanced) ----------
+ACCEPT_DIST_THRESH = 0.30
+REVOKE_DIST_THRESH = 0.36
+TOP2_MARGIN_MIN    = 0.08
+TOP2_RATIO_MAX     = 0.92
 
-
+# ---------- Speed profile ----------
 if FAST_MODE:
-    FRAME_DOWNSCALE = 1.0
-    DETECT_EVERY_N_BASE = 10
-    TRACKER_TYPE = "KCF"
-    MODEL_NAME   = "Facenet"
-    MAX_TEMPLATES_PER_ID = 6
-    STABLE_FRAMES_AUTH   = 5
-    COLOR_HOLD_FRAMES    = 8
-    MIN_BBOX_AREA   = 70 * 70
-    MIN_LAPLACE_VAR = 40.0
+    FRAME_DOWNSCALE       = 1.0
+    DETECT_EVERY_N_BASE   = 15
+    TRACKER_TYPE          = "KCF"
+    MODEL_NAME            = "ArcFace"
+    MAX_TEMPLATES_PER_ID  = 16
+    STABLE_FRAMES_AUTH    = 5
+    COLOR_HOLD_FRAMES     = 8
+    MIN_BBOX_AREA         = 110 * 110
+    MIN_LAPLACE_VAR       = 55.0
 else:
-    FRAME_DOWNSCALE = 1.0
-    DETECT_EVERY_N_BASE = 6
-    TRACKER_TYPE = "CSRT"
-    MODEL_NAME   = "Facenet512"
-    MAX_TEMPLATES_PER_ID = 6
-    STABLE_FRAMES_AUTH   = 5
-    COLOR_HOLD_FRAMES    = 12
-    MIN_BBOX_AREA   = 80 * 80
-    MIN_LAPLACE_VAR = 45.0
+    FRAME_DOWNSCALE       = 1.0
+    DETECT_EVERY_N_BASE   = 10
+    TRACKER_TYPE          = "CSRT"
+    MODEL_NAME            = "Facenet512"
+    MAX_TEMPLATES_PER_ID  = 16
+    STABLE_FRAMES_AUTH    = 5
+    COLOR_HOLD_FRAMES     = 12
+    MIN_BBOX_AREA         = 110 * 110
+    MIN_LAPLACE_VAR       = 55.0
 
-HEAVY_MIN_PERIOD_SEC   = 0.25
+# Recognition cadence tuning
+HEAVY_MIN_PERIOD_SEC   = 0.45
 NO_FACE_BACKOFF_MAX_N  = 24
 NO_FACE_BACKOFF_STEP   = 2
 
-# staged capture
+# ---------- Enrollment capture (staged) ----------
 STAGE_LIST = [
-    ("front",       4, "استعد لوضعية الوجه الأمامي"),
-    ("right_side",  3, "استعد لوضعية الجانب الأيمن"),
-    ("left_side",   3, "استعد لوضعية الجانب الأيسر"),
+    ("front",      5, "واجه الكاميرا"),
+    ("right_side", 4, " الجانب الايمن"),
+    ("left_side",  4, " الجانب الايسر"),
+    ("look_up",    3, "ارفع ذقنك لفوق"),
+    ("look_down",  3, "انزل ذقنك لتحت"),
 ]
-PRE_CAPTURE_COOLDOWN_SEC = 10.0
-STAGE_COOLDOWN_SEC       = 10.0
-STAGE_TIMEOUT_PER_STAGE  = 25.0
-CAPTURE_IMAGE_INTERVAL   = 0.25
 
-NEW_USER_PREFIX          = "user_"
-MIRROR_WEBCAM            = False
-CAPTURE_TRIGGER_COOLDOWN_SEC = 8.0
-DIRECT_ENROLL_TO_AUTH    = True
+PRE_CAPTURE_COOLDOWN_SEC      = 10.0
+STAGE_COOLDOWN_SEC            = 10.0
+STAGE_TIMEOUT_PER_STAGE       = 25.0
+CAPTURE_IMAGE_INTERVAL        = 0.25
+CAPTURE_TRIGGER_COOLDOWN_SEC  = 8.0
 
-CAPTURE_ONLY_WHEN_UNAUTHORIZED   = True
-CAPTURE_MIN_DIST_FOR_NEW         = 0.55
-CAPTURE_SUPPRESS_AFTER_AUTH_SEC  = 15.0
+NEW_USER_PREFIX       = "user_"
+DIRECT_ENROLL_TO_AUTH = True
+MIRROR_WEBCAM         = False
 
-# TTS (Arabic)
-ENABLE_TTS      = True
-TTS_LANG        = "ar"
-TTS_DEDUPE_SEC  = 4.0
-TTS_CACHE_DIR   = Path("tts_cache")
+# Enrollment safety (currently relaxed in your gating function)
+CAPTURE_ONLY_WHEN_UNAUTHORIZED  = True
+CAPTURE_MIN_DIST_FOR_NEW        = 0.55
+CAPTURE_SUPPRESS_AFTER_AUTH_SEC = 15.0
 
-# Name prompt
+# ---------- Arabic TTS ----------
+ENABLE_TTS     = True
+TTS_LANG       = "ar"
+TTS_DEDUPE_SEC = 4.0
+TTS_CACHE_DIR  = Path("tts_cache")
+
+# ---------- Name prompt ----------
 NAME_PROMPT_TIMEOUT_SEC = 12.0
 
-# UI
-DRAW_THICKNESS     = 2
-FONT               = cv2.FONT_HERSHEY_SIMPLEX
-DIST_SMOOTH_ALPHA  = 0.30
-BBOX_SMOOTH_ALPHA  = 0.40
-OVERLAY_TEXT       = (255,255,255)
+# ---------- UI ----------
+DRAW_THICKNESS    = 2
+FONT              = cv2.FONT_HERSHEY_SIMPLEX
+DIST_SMOOTH_ALPHA = 0.30
+BBOX_SMOOTH_ALPHA = 0.65
+OVERLAY_TEXT      = (255, 255, 255)
 
-# How much to zoom the window (display only)
-UI_SCALE           = 1.5   # 1.0 = original; 2.0 = 2x bigger
-
+# Display only (does not affect processing)
+UI_SCALE = 1.5
 
 # ================ GLOBAL STATE ================
 DB_TEMPLATES: Dict[str, List[np.ndarray]] = {}
@@ -172,6 +168,22 @@ _pending_staging_lock  = threading.Lock()
 _last_capture_trigger_ts = 0.0
 _last_capture_frame_idx = -999999
 
+
+AUTO_UPDATE_TEMPLATES = True
+AUTO_UPDATE_THRESH = 0.30
+AUTO_UPDATE_MIN_GAP_SEC = 600  # 10 minutes
+
+_last_template_update = {}  # name -> last update time
+
+_locked_identity = None
+_switch_candidate = None
+_switch_count = 0
+
+SWITCH_DELTA   = 0.06   # how much better the new identity must be
+SWITCH_FRAMES = 4      # how many heavy cycles it must win
+
+
+
 # ----- External / API control flags -----
 ENROLL_REQUESTED_FROM_API = False
 ENROLL_LAST_API_REASON = ""
@@ -217,81 +229,130 @@ def _ui_show_name_prompt_banner(duration: float = NAME_PROMPT_TIMEOUT_SEC):
         _name_prompt_banner_until = time.time() + max(2.0, duration)
 
 # ================ gTTS speaker ================
-# ================ Simple Arabic TTS (gTTS + playsound) ================
-# ================ Simple Arabic TTS (gTTS + playsound) ================
+# ================ TTS (Arabic) — reliable on Windows ================
+import queue
+
 try:
     from gtts import gTTS
-    from playsound import playsound
     _tts_available = True
-except ImportError:
-    print("[WARN] gTTS / playsound not installed → TTS disabled.")
+except Exception as e:
+    print("[WARN] gTTS not available:", e)
     _tts_available = False
-    ENABLE_TTS = False  # override global flag if missing deps
+    ENABLE_TTS = False
 
 TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-_last_tts = {"text": "", "ts": 0.0}
-tts_lock = threading.Lock()
 
+_tts_q = queue.Queue(maxsize=50)
+_tts_last_said = {"text": "", "ts": 0.0}
+_tts_gen_lock = threading.Lock()
 
 def _tts_get_path(text: str) -> str:
-    """Return cached mp3 path for given text, generating it if needed."""
     key = hashlib.md5((TTS_LANG + "||" + text).encode("utf-8")).hexdigest()[:16]
-    mp3_path = TTS_CACHE_DIR / f"{key}.mp3"
+    mp3_path = (TTS_CACHE_DIR / f"{key}.mp3").resolve()
 
     if not mp3_path.exists():
-        tts = gTTS(text=text, lang=TTS_LANG)
-        tts.save(str(mp3_path))
+        with _tts_gen_lock:
+            if not mp3_path.exists():
+                gTTS(text=text, lang=TTS_LANG).save(str(mp3_path))
 
-    # IMPORTANT: fix path for Windows MCI (no backslashes)
-    safe_path = str(mp3_path.resolve()).replace("\\", "/")
-    return safe_path
+    return str(mp3_path)
+
+def _play_file_blocking(path: str):
+    ap = str(Path(path).resolve()).replace("'", "''")
+
+    ps = (
+        "Add-Type -AssemblyName presentationCore; "
+        f"$path='{ap}'; "
+        "$uri = New-Object System.Uri($path); "
+        "$p   = New-Object System.Windows.Media.MediaPlayer; "
+        "$p.Open($uri); $p.Volume=1.0; $p.Play(); "
+
+        # Wait until duration is known (up to 2 seconds)
+        "$t0 = Get-Date; "
+        "while (-not $p.NaturalDuration.HasTimeSpan -and ((Get-Date) - $t0).TotalSeconds -lt 2) { Start-Sleep -Milliseconds 50 } "
+
+        # If duration is known -> wait till end, else fallback sleep
+        "if ($p.NaturalDuration.HasTimeSpan) { "
+        "  while ($p.Position -lt $p.NaturalDuration.TimeSpan) { Start-Sleep -Milliseconds 100 } "
+        "} else { "
+        "  Start-Sleep -Seconds 4 "
+        "}"
+    )
+
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-STA", "-Command", ps],
+        capture_output=True,
+        text=True
+    )
+
+    if r.returncode != 0 or r.stderr.strip():
+        print("[TTS PS rc]", r.returncode)
+        if r.stderr.strip():
+            print("[TTS PS stderr]", r.stderr.strip())
+
+def _tts_worker():
+    while True:
+        item = _tts_q.get()
+        if item is None:
+            break
+        text = item.get("text", "")
+        if not text:
+            continue
+        try:
+            path = _tts_get_path(text)
+            print("[SAY]", text)
+            _play_file_blocking(path)
+        except Exception as e:
+            print("[TTS ERROR]", e)
+
+_tts_thread = threading.Thread(target=_tts_worker, daemon=True)
+_tts_thread.start()
+
+def shutdown_tts():
+    """Stop TTS worker gracefully."""
+    try:
+        _tts_q.put_nowait(None)  # sentinel to stop worker
+    except Exception:
+        try:
+            _tts_q.put(None)
+        except Exception:
+            pass
+
+    try:
+        _tts_thread.join(timeout=1.0)
+    except Exception:
+        pass
+
 
 def speak(text: str):
     if not ENABLE_TTS or not _tts_available:
         return
-    """Non-blocking, cached Arabic TTS using gTTS + playsound (for general use)."""
-    global _last_tts
-
-    if not ENABLE_TTS:
-        return
 
     now = time.time()
-    last_text = _last_tts["text"]
-    last_ts   = _last_tts["ts"]
 
-    # de-duplicate same phrase within TTS_DEDUPE_SEC
-    if text == last_text and (now - last_ts) < TTS_DEDUPE_SEC:
+    # de-dup same phrase within window
+    if text == _tts_last_said["text"] and (now - _tts_last_said["ts"]) < TTS_DEDUPE_SEC:
         return
+    _tts_last_said["text"] = text
+    _tts_last_said["ts"] = now
 
-    _last_tts["text"] = text
-    _last_tts["ts"]   = now
-
-    print("[SAY]", text)
-
-    def _worker():
-        try:
-            safe_path = _tts_get_path(text)
-            # 🔒 Only one audio at a time
-            with tts_lock:
-                playsound(safe_path)
-        except Exception as e:
-            print("[TTS ERROR]", e)
-
-    threading.Thread(target=_worker, daemon=True).start()
-
+    # enqueue (non-blocking)
+    try:
+        _tts_q.put_nowait({"text": text})
+    except queue.Full:
+        print("[TTS] queue full -> dropped:", text)
 
 def speak_sync(text: str):
-    """Blocking TTS (used when we want the phrase to finish BEFORE continuing)."""
-    if not ENABLE_TTS:
+    """Blocking TTS (use rarely)."""
+    if not ENABLE_TTS or not _tts_available:
         return
     try:
+        path = _tts_get_path(text)
         print("[SAY_SYNC]", text)
-        safe_path = _tts_get_path(text)
-        # 🔒 Also serialized with async speaks
-        with tts_lock:
-            playsound(safe_path)
+        _play_file_blocking(path)
     except Exception as e:
         print("[TTS ERROR SYNC]", e)
+
 
 # ================ DB =================
 def _db_connect():
@@ -365,6 +426,13 @@ def db_add_person(name: str) -> int:
         con.execute("INSERT OR IGNORE INTO persons(name, created_at) VALUES(?, ?)", (name, time.time()))
         row = con.execute("SELECT id FROM persons WHERE name=?", (name,)).fetchone()
         return int(row[0])
+    
+def is_diverse_enough(new_e, existing_list, min_cos_dist=0.10):
+    # want templates that differ at least a bit
+    for e in existing_list:
+        if cosine_distance(new_e, e) < min_cos_dist:
+            return False
+    return True
 
 def db_add_template(person_id: int, emb: np.ndarray):
     emb = np.asarray(emb, dtype=np.float32).tobytes()
@@ -446,17 +514,18 @@ def log_event(name: str, status: str, distance: Optional[float]) -> bool:
                 print(f"[INFO] Skip log_event: {name} already has {status} for {today_str}")
 
                 # 🔊 TTS: special message when attendance already exists
-                # --- Only play this message if at least 5 seconds passed since last one for this user ---
+                # --- Only play this message if at least 20 seconds passed since last one for this user ---
                 global _last_repeat_tts_time
                 now_ts = time.time()
                 last_ts = _last_repeat_tts_time.get((name, status), 0)
 
                 if (now_ts - last_ts) >= 20.0:
                     if status == "Arrival":
-                        speak(f"مرحباً يا {name}، تم تسجيل حضورك بالفعل اليوم.")
+                        speak(f"مرحباً يا {name}. حضورك مسجل اليوم.")
                     else:
-                        speak(f"إلى اللقاء يا {name}، تم تسجيل انصرافك بالفعل اليوم.")
+                        speak(f"إلى اللقاء يا {name}. انصرافك مسجل اليوم.")
                     _last_repeat_tts_time[(name, status)] = now_ts
+
 
 
                 return False  # no new DB insert
@@ -480,12 +549,9 @@ def log_event(name: str, status: str, distance: Optional[float]) -> bool:
 
         # 🔊 TTS feedback (Arabic) + welcome/goodbye for first time today
         if status == "Arrival":
-            speak(f"تم تسجيل الحضور لِـ {name}")
-            speak(f"مرحباً يا {name}")
+            speak(f"مرحباً يا {name}. تم تسجيل حضورك.")
         else:
-            speak(f"تم تسجيل الانصراف لِـ {name}")
-            speak(f"إلى اللقاء يا {name}")
-
+            speak(f"إلى اللقاء يا {name}. تم تسجيل انصرافك.")
         return True
 
     except Exception as e:
@@ -642,72 +708,54 @@ def embed_bgr_crop(model_pair, bgr: np.ndarray) -> Optional[np.ndarray]:
         print(f"[WARN] embedding failed: {e}")
         return None
 
-# ================ Detection (cascade) ================
-FRONTAL_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-PROFILE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+# ================ Detection (YuNet) ================
+YUNET_MODEL_PATH = str(Path("face_detection_yunet_2023mar.onnx").resolve())
 
-def _dynamic_min_size(w: int, h: int) -> Tuple[int, int]:
-    m = max(32, int(min(w, h) * 0.10))
-    m = min(m, max(32, min(w, h)))
-    return (m, m)
+# Tune these for your camera
+YUNET_CONF_THRESH = 0.60   # lower => more recall, higher => fewer false positives
+YUNET_NMS_THRESH  = 0.30
+YUNET_TOPK        = 500
 
-def _detect_with_cascade(gray, cascade, min_size):
-    try:
-        faces = cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.15,
-            minNeighbors=8,
-            flags=cv2.CASCADE_SCALE_IMAGE,
-            minSize=min_size
-        )
-        return faces
-    except Exception as e:
-        print("[DETECT] error:", e)
-        return ()
+_yunet = None
+_yunet_lock = threading.Lock()
 
-def _bbox_from_faces(faces):
-    if len(faces) == 0:
-        return None
-    x,y,ww,hh = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
-    return (x,y,x+ww,y+hh)
-
-def detect_largest_face_bbox(bgr: np.ndarray) -> Optional[Tuple[int,int,int,int]]:
-    if bgr is None or bgr.size == 0:
-        return None
-    h,w = bgr.shape[:2]
-    if w < 32 or h < 32:
-        return None
-    try:
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    except Exception:
-        return None
-
-    # 🔧 make detection more robust under poor lighting
-    gray = _normalize_gray_lighting(gray)
-
-    mn = _dynamic_min_size(w,h)
-
-
-    faces = _detect_with_cascade(gray, FRONTAL_CASCADE, mn)
-    if len(faces):
-        return _bbox_from_faces(faces)
-
-    faces = _detect_with_cascade(gray, PROFILE_CASCADE, mn)
-    if len(faces):
-        return _bbox_from_faces(faces)
-
-    gray_flipped = cv2.flip(gray, 1)
-    faces = _detect_with_cascade(gray_flipped, PROFILE_CASCADE, mn)
-    if len(faces):
-        x,y,ww,hh = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
-        x1 = w - (x + ww); y1 = y; x2 = w - x; y2 = y + hh
-        return (x1,y1,x2,y2)
-
-    return None
-
-def detect_multi_face_bboxes(bgr: np.ndarray, max_faces: int = 5) -> List[Tuple[int,int,int,int]]:
+def _get_yunet(input_w: int, input_h: int):
     """
-    Detect up to max_faces faces (front + left + right profiles) and return boxes (x1, y1, x2, y2).
+    Create (or update) YuNet detector for current frame size.
+    YuNet needs input size set to the frame size.
+    """
+    global _yunet
+    with _yunet_lock:
+        if _yunet is None:
+            if not Path(YUNET_MODEL_PATH).exists():
+                raise FileNotFoundError(
+                    f"YuNet model not found: {YUNET_MODEL_PATH}\n"
+                    "Put face_detection_yunet_2023mar.onnx next to this script."
+                )
+            _yunet = cv2.FaceDetectorYN.create(
+                YUNET_MODEL_PATH,
+                "",  # config (unused)
+                (input_w, input_h),
+                YUNET_CONF_THRESH,
+                YUNET_NMS_THRESH,
+                YUNET_TOPK
+            )
+        else:
+            _yunet.setInputSize((input_w, input_h))
+        return _yunet
+
+def _clip_bbox(x1, y1, x2, y2, w, h):
+    x1 = max(0, min(int(x1), w - 1))
+    y1 = max(0, min(int(y1), h - 1))
+    x2 = max(0, min(int(x2), w - 1))
+    y2 = max(0, min(int(y2), h - 1))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+def _detect_faces_yunet(bgr: np.ndarray) -> List[Tuple[int,int,int,int,float]]:
+    """
+    Returns list of (x1,y1,x2,y2,score).
     """
     if bgr is None or bgr.size == 0:
         return []
@@ -715,112 +763,50 @@ def detect_multi_face_bboxes(bgr: np.ndarray, max_faces: int = 5) -> List[Tuple[
     if w < 32 or h < 32:
         return []
 
-    try:
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    except Exception:
+    det = _get_yunet(w, h)
+
+    img = bgr if bgr.dtype == np.uint8 else bgr.astype(np.uint8)
+
+    _, faces = det.detect(img)
+    if faces is None or len(faces) == 0:
         return []
 
-    # 🔧 lighting normalization for multi-face detection
-    gray = _normalize_gray_lighting(gray)
+    out = []
+    for f in faces:
+        x, y, ww, hh = float(f[0]), float(f[1]), float(f[2]), float(f[3])
+        score = float(f[-1])
+        box = _clip_bbox(x, y, x + ww, y + hh, w, h)
+        if box is None:
+            continue
+        x1, y1, x2, y2 = box
+        out.append((x1, y1, x2, y2, score))
 
-    mn = _dynamic_min_size(w, h)
+    out.sort(key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
+    return out
 
+def detect_largest_face_bbox(bgr: np.ndarray) -> Optional[Tuple[int,int,int,int]]:
+    faces = _detect_faces_yunet(bgr)
+    if not faces:
+        return None
+    x1,y1,x2,y2,_ = faces[0]
+    return (x1,y1,x2,y2)
 
-    boxes: List[Tuple[int,int,int,int]] = []
-
-    # 1) frontal faces
-    faces_f = _detect_with_cascade(gray, FRONTAL_CASCADE, mn)
-    for (x, y, ww, hh) in faces_f:
-        boxes.append((x, y, x + ww, y + hh))
-
-    # 2) right profiles
-    faces_r = _detect_with_cascade(gray, PROFILE_CASCADE, mn)
-    for (x, y, ww, hh) in faces_r:
-        boxes.append((x, y, x + ww, y + hh))
-
-    # 3) left profiles (flip)
-    gray_flipped = cv2.flip(gray, 1)
-    faces_l = _detect_with_cascade(gray_flipped, PROFILE_CASCADE, mn)
-    for (x, y, ww, hh) in faces_l:
-        x1 = w - (x + ww)
-        y1 = y
-        x2 = w - x
-        y2 = y + hh
-        boxes.append((x1, y1, x2, y2))
-
-    if not boxes:
-        # fallback: largest single face using the old routine
-        one = detect_largest_face_bbox(bgr)
-        return [one] if one is not None else []
-
-    # remove near-duplicate boxes (simple overlap filter)
-    merged = []
-    for b in sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True):
-        x1, y1, x2, y2 = b
-        area_b = (x2 - x1) * (y2 - y1)
-        keep = True
-        for (mx1, my1, mx2, my2) in merged:
-            inter_x1 = max(x1, mx1)
-            inter_y1 = max(y1, my1)
-            inter_x2 = min(x2, mx2)
-            inter_y2 = min(y2, my2)
-            if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
-                continue
-            inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
-            if inter_area / float(area_b + 1e-6) > 0.6:
-                keep = False
-                break
-        if keep:
-            merged.append(b)
-
-    merged = sorted(merged, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
-    if max_faces > 0 and len(merged) > max_faces:
-        merged = merged[:max_faces]
-
-    return merged
+def detect_multi_face_bboxes(bgr: np.ndarray, max_faces: int = 5) -> List[Tuple[int,int,int,int]]:
+    faces = _detect_faces_yunet(bgr)
+    if not faces:
+        return []
+    faces = faces[:max_faces] if max_faces > 0 else faces
+    return [(x1,y1,x2,y2) for (x1,y1,x2,y2,score) in faces]
 
 def detect_face_for_stage(bgr: np.ndarray, stage_name: str) -> Optional[Tuple[int,int,int,int]]:
-    # stage-aware detection (front/profile/left via flipped profile)
-    if bgr is None or bgr.size == 0:
-        return None
-    h,w = bgr.shape[:2]
-    if w < 32 or h < 32:
-        return None
-    try:
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    except Exception:
-        return None
-
-    # 🔧 more robust stage detection in bad lighting
-    gray = _normalize_gray_lighting(gray)
-
-    mn = _dynamic_min_size(w,h)
-
-
-    if stage_name == "front":
-        faces = _detect_with_cascade(gray, FRONTAL_CASCADE, mn)
-        if len(faces):
-            return _bbox_from_faces(faces)
-        return detect_largest_face_bbox(bgr)
-
-    if stage_name == "right_side":
-        faces = _detect_with_cascade(gray, PROFILE_CASCADE, mn)
-        if len(faces):
-            return _bbox_from_faces(faces)
-        return detect_largest_face_bbox(bgr)
-
-    if stage_name == "left_side":
-        gray_flipped = cv2.flip(gray, 1)
-        faces = _detect_with_cascade(gray_flipped, PROFILE_CASCADE, mn)
-        if len(faces):
-            x,y,ww,hh = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
-            x1 = w - (x + ww); y1 = y; x2 = w - x; y2 = y + hh
-            return (x1,y1,x2,y2)
-        return detect_largest_face_bbox(bgr)
-
+    """
+    With YuNet we don't rely on frontal/profile cascades.
+    For enrollment stages, we take the largest detected face.
+    """
     return detect_largest_face_bbox(bgr)
 
 def is_crop_usable(bgr_crop: np.ndarray) -> bool:
+    # KEEP YOUR EXACT ORIGINAL FUNCTION LOGIC (paste your old code here)
     if bgr_crop is None or bgr_crop.size == 0:
         return False
 
@@ -830,20 +816,16 @@ def is_crop_usable(bgr_crop: np.ndarray) -> bool:
 
     g = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
 
-    # ---- NEW: reject over-bright / over-dark blobs (like lamps) ----
     mean_val = float(g.mean())
-    # tune these numbers if needed
-    if mean_val > 220:      # too bright → likely lamp / light source
+    if mean_val > 220:
         return False
-    if mean_val < 35:       # too dark → noisy shadows
+    if mean_val < 35:
         return False
 
-    # optional: reject crops with too many saturated pixels
     sat_ratio = np.count_nonzero(g > 245) / (w * h)
-    if sat_ratio > 0.30:    # >30% of pixels are pure white
+    if sat_ratio > 0.30:
         return False
 
-    # existing sharpness / blur check
     if cv2.Laplacian(g, cv2.CV_64F).var() < MIN_LAPLACE_VAR:
         return False
 
@@ -926,6 +908,55 @@ def _match(db, emb):
 
     return best_name, best_dist, second
 
+
+def split_crops(face_bgr: np.ndarray) -> List[np.ndarray]:
+    """
+    Create multiple crops from one face:
+    - full face
+    - upper region (less beard effect)
+    - mid region (less chin + sometimes less glasses glare)
+    """
+    if face_bgr is None or face_bgr.size == 0:
+        return []
+
+    h, w = face_bgr.shape[:2]
+    full = face_bgr
+
+    upper = face_bgr[0:int(0.60*h), :]           # eyes/forehead
+    y1 = int(0.15*h); y2 = int(0.75*h)
+    mid = face_bgr[y1:y2, :]                     # middle region
+
+    crops = []
+    for c in (full, upper, mid):
+        if c is not None and c.size > 0:
+            crops.append(c)
+    return crops
+
+
+def best_match_multi_crop(model_pair, db, bgr_crop: np.ndarray):
+    """
+    Try multi-crop embeddings and pick the best match overall.
+    """
+    if bgr_crop is None or bgr_crop.size == 0:
+        return None
+
+    candidates = []
+    for c in split_crops(bgr_crop):
+        emb = embed_bgr_crop(model_pair, c)
+        if emb is None:
+            continue
+        m = _match(db, emb)
+        if m is None:
+            continue
+        best_name, best_dist, second = m
+        candidates.append((best_name, best_dist, second))
+
+    if not candidates:
+        return None
+
+    return min(candidates, key=lambda t: t[1])
+
+
 def best_match_for_crop(model_pair, db, bgr_crop: np.ndarray):
     """
     Try a few small rotations of the face crop and choose the orientation
@@ -936,7 +967,7 @@ def best_match_for_crop(model_pair, db, bgr_crop: np.ndarray):
     if bgr_crop is None or bgr_crop.size == 0:
         return None
 
-    angles = [0.0, -12.0, 12.0]   # you can add e.g. -20, +20 if needed
+    angles = [0.0, -18.0, 18.0, -30.0, 30.0]   # you can add e.g. -20, +20 if needed
     candidates = []
 
     for ang in angles:
@@ -976,20 +1007,34 @@ def recognize_heavy(model_pair, db, bgr, max_faces: int = 5):
     results = []
     for bbox in boxes:
         x1, y1, x2, y2 = bbox
-        crop = bgr[y1:y2, x1:x2]
+        pad = 0.18
+        h, w = bgr.shape[:2]
+        dx = int((x2 - x1) * pad)
+        dy = int((y2 - y1) * pad)
+
+        x1p = max(0, x1 - dx)
+        y1p = max(0, y1 - dy)
+        x2p = min(w - 1, x2 + dx)
+        y2p = min(h - 1, y2 + dy)
+
+        crop = bgr[y1p:y2p, x1p:x2p]
+
         if not is_crop_usable(crop):
             continue
 
-        match = best_match_for_crop(model_pair, db, crop)
+        match = best_match_multi_crop(model_pair, db, crop)
         if match is None:
             continue
 
         best_name, best_dist, second = match
 
+        accept = best_dist <= ACCEPT_DIST_THRESH
         clear_margin = (second - best_dist) >= TOP2_MARGIN_MIN
         clear_ratio  = (best_dist / max(second, 1e-9)) <= TOP2_RATIO_MAX
-        accept       = best_dist <= ACCEPT_DIST_THRESH
+
         is_auth_fast = accept and clear_margin and clear_ratio
+
+
 
         # 🔍 DEBUG: see how good/bad the match is
         print(
@@ -1246,19 +1291,14 @@ def embed_from_session(model_pair, images: list) -> Optional[np.ndarray]:
     Given a list of (stage_name, img_bgr) from memory,
     return the first usable embedding (for duplicate check).
     """
-    for stage_name, img in images:
-        if img is None or img.size == 0:
+    # embed_from_session
+    for stage_name, face_crop in images:
+        if not is_crop_usable(face_crop):
             continue
-        bbox = detect_largest_face_bbox(img)
-        if bbox is None:
-            continue
-        x1, y1, x2, y2 = bbox
-        crop = img[y1:y2, x1:x2]
-        if not is_crop_usable(crop):
-            continue
-        e = embed_bgr_crop(model_pair, crop)
+        e = embed_bgr_crop(model_pair, face_crop)
         if e is not None:
             return e
+
     return None
 
 def duplicate_check(emb) -> Optional[Tuple[str,float]]:
@@ -1356,27 +1396,25 @@ def finalize_one(model_pair, session: dict):
         person_dir.mkdir(parents=True, exist_ok=True)
 
         img_idx = 0
+        local_embs = []
+        embs_added = 0
+
         for stage_name, img in images:
-            if img is None or img.size == 0:
-                continue
-
-            bbox = detect_largest_face_bbox(img)
-            if bbox is None:
-                continue
-            x1, y1, x2, y2 = bbox
-            crop = img[y1:y2, x1:x2]
-            if not is_crop_usable(crop):
-                continue
-
-            e = embed_bgr_crop(model_pair, crop)
+            # Embed from the captured image crop
+            e = embed_bgr_crop(model_pair, img)
             if e is None:
                 continue
 
-            # Add template to SQLite
+            # Keep only diverse templates
+            if not is_diverse_enough(e, local_embs, min_cos_dist=0.10):
+                continue
+
+            # Save template to SQLite
             db_add_template(pid, e)
+            local_embs.append(e)
             embs_added += 1
 
-            # Save physical image file AFTER everything is valid
+            # Save physical image file
             img_idx += 1
             out_path = person_dir / f"{final_name}_{stage_name}_{img_idx:02d}.jpg"
             try:
@@ -1384,12 +1422,13 @@ def finalize_one(model_pair, session: dict):
             except Exception as ee:
                 print(f"[ENROLL] warning: failed to save {out_path}: {ee}")
 
-            # Optional: also store in DB if enabled
+            # Optional: also store the same image in DB
             if STORE_IMAGES_IN_DB:
-                db_add_image(pid, stage_name, crop)
+                db_add_image(pid, stage_name, img)
 
             if embs_added >= MAX_TEMPLATES_PER_ID:
                 break
+
 
         print(f"[ENROLL] finalized in SQLite for '{final_name}' (templates: {embs_added})")
 
@@ -1525,6 +1564,7 @@ def start_system_in_background():
 
 # ================ Main =================
 def main():
+    global _locked_identity, _switch_candidate, _switch_count
     global _last_heavy_submit_ts, _detect_every_n, _no_face_cycles
     global _current_identity, _auth_streak, _smoothed_dist, _smoothed_bbox
     global _last_detect_recog_s, _last_auth_latency_s, _pending_auth_identity, _pending_auth_start_ts
@@ -1541,16 +1581,13 @@ def main():
     migrate_folder_to_sqlite_if_needed(model_pair)
     DB_TEMPLATES = db_templates_dict()
 
-    win_name = "Face System (SQLite, press 'g' to enroll)"
+    win_name = "HR Face System"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, 1280, 720)   # ~YouTube size
 
 
 
-    # Quick sanity check: are cascades loaded?
-    print("[DEBUG] Haar path:", cv2.data.haarcascades)
-    print("[DEBUG] FRONTAL_CASCADE empty:", FRONTAL_CASCADE.empty())
-    print("[DEBUG] PROFILE_CASCADE empty:", PROFILE_CASCADE.empty())
+    print("[DEBUG] YuNet model exists:", Path(YUNET_MODEL_PATH).exists())
 
     # ---------- Camera open helper ----------
     def open_capture():
@@ -1592,20 +1629,25 @@ def main():
             self.busy = False
             self.frame = None
             self.res = None
+            self.res_frame_idx = -1
+            self.submit_frame_idx = -1
             self.stop = False
             self.thread = threading.Thread(target=self._loop, daemon=True)
             self.thread.start()
 
-        def submit(self, frame):
+        def submit(self, frame, frame_idx):
             if self.busy:
                 return False
             with self.lock:
                 self.frame = frame.copy()
+                self.submit_frame_idx = frame_idx
                 self.busy = True
             return True
 
-        def get(self):
-            return self.res
+        def get_latest(self):
+            with self.lock:
+                return self.res
+
 
         def _loop(self):
             while not self.stop:
@@ -1618,10 +1660,10 @@ def main():
                     time.sleep(0.01)
                     continue
                 try:
-                    self.res = recognize_heavy(self.model, DB_TEMPLATES, f)
-                except Exception as e:
-                    print("[WARN] recognizer failed:", e)
-                    self.res = None
+                    r = recognize_heavy(self.model, DB_TEMPLATES, f, max_faces=2)
+                    with self.lock:
+                        self.res = r
+                        self.res_frame_idx = self.submit_frame_idx
                 finally:
                     with self.lock:
                         self.busy = False
@@ -1636,8 +1678,8 @@ def main():
     recog = Recognizer(model_pair)
     capt  = CaptureWorker()
 
-    print("[INFO] running. Press 'g' to enroll. 'q' to quit.")
-    speak("النظام يعمل الآن. يمكنك الضغط على حرف جي من لوحة المفاتيح لتسجيل مستخدم جديد.")
+    print("[INFO] running. press 'q' on keyboard or window's 'X' to quit.")
+    speak("النظام يعمل الآن")
     loop_ts = time.perf_counter()
     frame_idx = 0
 
@@ -1676,6 +1718,10 @@ def main():
                 _latest_frame_for_capture = frame.copy()
 
             frame_idx += 1
+            # --- SAFE DEFAULTS (so stats section never crashes) ---
+            identity = None
+            is_authorized = False
+
 
             # 1) Recognition cadence
             run_heavy_due_to_cadence = (frame_idx % _detect_every_n) == 0 or (_tracker is None)
@@ -1683,8 +1729,12 @@ def main():
 
             if run_heavy_due_to_cadence and run_heavy_due_to_period:
                 _last_heavy_submit_ts = time.time()
-                recog.submit(frame_disp)
-                rec = recog.get()
+                # submit needs frame_idx
+                recog.submit(frame_disp, frame_idx)
+
+                # fetch result that matches the submitted frame
+                rec = recog.get_latest()
+
 
                 if rec is None:
                     # No fresh result yet → keep previous tracker/labels as-is
@@ -1700,6 +1750,9 @@ def main():
                     )
                     _last_secondary_overlays = []
                     _current_identity = None
+                    _locked_identity = None
+                    _switch_candidate = None
+                    _switch_count = 0
                     _auth_streak = 0
 
                 else:
@@ -1715,10 +1768,53 @@ def main():
                                 break
 
                     (bbox, identity, dist_raw, is_auth_raw, secs) = rec[primary_idx]
-                    secondary_faces = [rec[i] for i in range(len(rec)) if i != primary_idx]
+                    # ✅ DEFINE raw_ok BEFORE USING IT ANYWHERE
+                    raw_ok = bool(is_auth_raw) and (identity is not None) and (identity != "Unknown")
+                    # --------- IDENTITY LOCKING (ANTI-FLIP) ----------
+                    if _locked_identity is None:
+                        if raw_ok and dist_raw <= ACCEPT_DIST_THRESH:
+                            _locked_identity = identity
+                        if not raw_ok:
+                            _locked_identity = None
+                            _switch_candidate = None
+                            _switch_count = 0
 
+                    elif identity != _locked_identity:
+                        dist_locked = None
+                        for (bb, name_i, d_i, _, _) in rec:
+                            if name_i == _locked_identity:
+                                dist_locked = d_i
+                                break
+
+                        if dist_locked is not None and (dist_locked - dist_raw) >= SWITCH_DELTA:
+                            if _switch_candidate == identity:
+                                _switch_count += 1
+                            else:
+                                _switch_candidate = identity
+                                _switch_count = 1
+
+                            if _switch_count >= SWITCH_FRAMES:
+                                print(f"[LOCK] switching {_locked_identity} → {identity}")
+                                _locked_identity = identity
+                                _switch_candidate = None
+                                _switch_count = 0
+                        else:
+                            _switch_candidate = None
+                            _switch_count = 0
+
+                    identity = _locked_identity
+
+                    secondary_faces = [rec[i] for i in range(len(rec)) if i != primary_idx]
                     _last_detect_recog_s = secs
-                    _smoothed_dist = ema(_smoothed_dist, float(dist_raw), DIST_SMOOTH_ALPHA)
+
+                    # --------- DISTANCE SMOOTHING (anti-poison) ----------
+                    if not raw_ok:
+                        _smoothed_dist = None
+                    else:
+                        if _smoothed_dist is not None and dist_raw < 0.12 and _smoothed_dist > 0.25:
+                            _smoothed_dist = float(dist_raw)
+                        else:
+                            _smoothed_dist = ema(_smoothed_dist, float(dist_raw), DIST_SMOOTH_ALPHA)
 
                     x1, y1, x2, y2 = bbox
                     _smoothed_bbox = ema_bbox(_smoothed_bbox, (x1, y1, x2, y2), BBOX_SMOOTH_ALPHA)
@@ -1748,6 +1844,9 @@ def main():
                             _auth_streak = 1
                             _pending_auth_identity = identity
                             _pending_auth_start_ts = time.perf_counter()
+                        # ---- auth latency (only when auth becomes stable) ----
+                        if is_authorized and _pending_auth_identity == identity and _auth_streak == STABLE_FRAMES_AUTH:
+                            _last_auth_latency_s = time.perf_counter() - _pending_auth_start_ts
                     else:
                         _current_identity = None
                         _auth_streak = 0
@@ -1794,6 +1893,26 @@ def main():
 
                     # ---------- ATTENDANCE EVENT (PRIMARY ONLY) ----------
                     _update_streak_and_maybe_log(identity, is_authorized, _smoothed_dist)
+
+                    if is_authorized and identity != "Unknown" and _smoothed_dist is not None:
+                        # use the same crop you used for matching (you may need to keep it in a variable)
+                        # make a crop in main() (from the current primary bbox)
+                        x1c, y1c, x2c, y2c = bbox
+                        h, w = frame_disp.shape[:2]
+
+                        pad = 0.18
+                        dx = int((x2c - x1c) * pad)
+                        dy = int((y2c - y1c) * pad)
+
+                        x1p = max(0, x1c - dx)
+                        y1p = max(0, y1c - dy)
+                        x2p = min(w - 1, x2c + dx)
+                        y2p = min(h - 1, y2c + dy)
+
+                        crop_for_update = frame_disp[y1p:y2p, x1p:x2p]
+
+                        # try_auto_update_template(model_pair, identity, crop_for_update, float(_smoothed_dist))
+
 
                     # --------- INIT TRACKER ON PRIMARY FACE ----------
                     _tracker = _create_tracker(TRACKER_TYPE)
@@ -2075,16 +2194,6 @@ def main():
             put(f"Auth latency: {_last_auth_latency_s:.3f} s")
             put(f"FPS: {fps:.1f}")
             put(f"Heavy cadence: ~{_detect_every_n} frames")
-            cv2.putText(
-                frame_disp,
-                "Press 'g' to enroll",
-                (10, frame_disp.shape[0] - 12),
-                FONT,
-                0.6,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA
-            )
 
             # Upscale ONLY for display; processing still uses small frame_disp
             display = frame_disp
@@ -2098,22 +2207,38 @@ def main():
 
             cv2.imshow(win_name, display)
 
-            # -------- Keyboard handling --------
+            # One waitKey per loop (Windows needs this to process X-click)
             key = cv2.waitKey(1) & 0xFF
 
-            # ---- Decide if there is an enrollment trigger (keyboard or API) ----
+            # Quit on 'q'
+            if key == ord('q'):
+                break
+
+            # Close on X / minimize (Windows)
+            try:
+                vis = cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE)
+                if vis < 1:
+                    break
+
+                xw, yw, ww, hw = cv2.getWindowImageRect(win_name)
+                if xw < -30000 or yw < -30000:
+                    break
+                if ww <= 1 or hw <= 1:
+                    break
+            except Exception:
+                break
+
+            # ---- Enrollment trigger (keyboard or API) ----
             trigger_source = None
 
-            # 1) Keyboard 'g'
             if key == ord('g'):
                 trigger_source = "keyboard"
 
-            # 2) API trigger
             if ENROLL_REQUESTED_FROM_API:
                 trigger_source = "api"
-                ENROLL_REQUESTED_FROM_API = False  # consume the request
+                ENROLL_REQUESTED_FROM_API = False  # consume
 
-            if trigger_source is not None and not _capture_in_progress:
+            if trigger_source and not _capture_in_progress:
                 allowed, reason = enroll_allowed_now()
                 if allowed:
                     if capt.start_capture():
@@ -2121,33 +2246,25 @@ def main():
                         _last_capture_frame_idx = frame_idx
 
                         if trigger_source == "keyboard":
-                            print("[MANUAL] 'g' → capture started.")
-                            speak("تم الضغط على جي. سيتم الآن تسجيل مستخدم جديد.")
+                            print("[MANUAL] 'g' -> capture started.")
+                            speak("تم بدء التسجيل.")
                         else:
-                            print("[API] HR requested enrollment → capture started.")
-                            speak("تم طلب تسجيل مستخدم جديد من خلال لوحة الموارد البشرية.")
+                            print("[API] capture started from HR panel.")
+                            speak("تم بدء التسجيل من خلال لوحة الموارد البشرية.")
                     else:
-                        print(f"[{trigger_source.upper()}] worker busy.")
-                        speak("لا يمكن بدء التسجيل الآن. عملية سابقة ما زالت قيد التنفيذ.")
+                        print(f"[{trigger_source.upper()}] capture worker busy.")
+                        speak("لا يمكن بدء التسجيل الآن. توجد عملية تسجيل جارية.")
                 else:
                     print(f"[{trigger_source.upper()}] capture blocked:", reason)
-                    if "face too similar" in reason:
-                        speak("لا يمكن إنشاء مستخدم جديد الآن. الوجه مشابه جداً لِوجه موجود.")
-                    elif "recent authorization" in reason:
-                        speak("تم التعرف على هذا الوجه منذ قليل. انتظر قليلاً قبل محاولة التسجيل مرة أخرى.")
-                    elif "currently authenticated" in reason:
-                        speak("هذا الوجه مسجل بالفعل كمستخدم معتمد.")
-                    elif "cooldown" in reason:
-                        speak("من فضلك انتظر قليلاً قبل محاولة التسجيل مرة أخرى.")
-                    else:
-                        speak("لا يمكن بدء التسجيل في الوقت الحالي.")
+                    speak("لا يمكن بدء التسجيل الآن. انتظر قليلاً ثم حاول مرة أخرى.")
 
             # -------- Quit key --------
             if key == ord('q'):
                 break
 
             # -------- Finalize any pending enrollments + reload DB if needed --------
-            finalize_all(model_pair)
+            # when session queued
+            threading.Thread(target=finalize_all, args=(model_pair,), daemon=True).start()
             with _request_db_reload_lock:
                 if _request_db_reload:
                     print("[DB] reloading templates...")
@@ -2159,14 +2276,14 @@ def main():
             recog.shutdown()
         except Exception:
             pass
-        # REMOVE this block (no _tts anymore):
-        # try:
-        #     _tts.shutdown()
-        # except Exception:
-        #     pass
+
+        try:
+            shutdown_tts()
+        except Exception:
+            pass
+
         cap.release()
         cv2.destroyAllWindows()
-
 
 
 if __name__ == "__main__":
